@@ -1,16 +1,14 @@
-#include <Servo.h>
-//#include "I2Cdev.h"
-#include "MPU6050_6Axis_MotionApps20.h"
-
-// Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
-// is used in I2Cdev.h
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    #include "Wire.h"
-#endif
-
+#include "pid.h"
 #include <SPI.h>
 #include "nRF24L01.h"
 #include "RF24.h"
+#include "printf.h"
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
+    #include "Wire.h"
+#endif
+#include <Servo.h>
 
 // AD0 low = 0x68
 // AD0 high = 0x69
@@ -18,9 +16,31 @@ MPU6050 mpu;
 //MPU6050 mpu(0x69); // <-- use for AD0 high
 
 Servo escfl, escfr, escbl, escbr;
+#define LONG_MAX 2147483647
+//---- roll ----
+PidVars roll_pid = {
+  .unwind = 0,  .doneZone = 0,  .maxIntegral = 500, .iActiveZone = 3,
+  .target = 0,  .sensVal = 0,   .prevSensVal = 0,   .prevErr = 0,
+  .errTot = 0,  .kp = 1.0,      .ki = 0.0,          .kd = 0.0,
+  .deriv = 0,   .prevTime = 0,  .doneTime = LONG_MAX,  .prevDUpdateTime = 0
+};
+//---- pitch ----
+PidVars pitch_pid  = {
+  .unwind = 0,  .doneZone = 0,  .maxIntegral = 500, .iActiveZone = 3,
+  .target = 0,  .sensVal = 0,   .prevSensVal = 0,   .prevErr = 0,
+  .errTot = 0,  .kp = 1.0,      .ki = 0.0,          .kd = 0.0,
+  .deriv = 0,   .prevTime = 0,  .doneTime = LONG_MAX,  .prevDUpdateTime = 0
+};
+//---- yaw ----
+PidVars yaw_pid = {
+  .unwind = 0,  .doneZone = 0,  .maxIntegral = 500, .iActiveZone = 3,
+  .target = 0,  .sensVal = 0,   .prevSensVal = 0,   .prevErr = 0,
+  .errTot = 0,  .kp = 1.0,      .ki = 0.0,          .kd = 0.0,
+  .deriv = 0,   .prevTime = 0,  .doneTime = LONG_MAX,  .prevDUpdateTime = 0
+};
 
 #define LED_PIN 4
-bool blinkState = true;
+long prevRadioUpdateT = -LONG_MAX;
 
 bool dmpReady = false;  // set true if DMP init was successful
 uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
@@ -36,19 +56,17 @@ float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gra
 
 RF24 radio(7, 8);
 
-const uint64_t pipe = 0xF0F0F0F0E1LL;
-
-int data[4];
-
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+//ISR
 void dmpDataReady() {
     mpuInterrupt = true;
 }
 
 const int MIN_MOTOR_POWER = 1148;
 const int MAX_MOTOR_POWER = 1600;//1832;
-
+int pitchCal, rollCal, yawCal;
 void setup() {
+    Serial.begin(9600);
     escfl.attach(9);
     escfr.attach(6);
     escbr.attach(5);
@@ -57,8 +75,6 @@ void setup() {
     escfr.writeMicroseconds(MIN_MOTOR_POWER);
     escbl.writeMicroseconds(MIN_MOTOR_POWER);
     escbr.writeMicroseconds(MIN_MOTOR_POWER);
-  
-    delay(3000);
   
     // join I2C bus (I2Cdev library doesn't do this automatically)
     #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
@@ -72,10 +88,9 @@ void setup() {
 
     devStatus = mpu.dmpInitialize();
 
-    //accel: 678 353 842     gyro: 62 -41 41
-    mpu.setXGyroOffset(62);
-    mpu.setYGyroOffset(-41);
-    mpu.setZGyroOffset(41);
+    mpu.setXGyroOffset(931);
+    mpu.setYGyroOffset(377);
+    mpu.setZGyroOffset(762);
     mpu.setXAccelOffset(678);
     mpu.setYAccelOffset(358);
     mpu.setZAccelOffset(842);// 1688 factory default for my test chip
@@ -91,67 +106,29 @@ void setup() {
 
     // configure LED for output
     pinMode(LED_PIN, OUTPUT);
-    setupRadio();
+    radio.begin();
+    radio.setAutoAck(1);
+    radio.enableAckPayload();
+    radio.setRetries(0, 15);
+    radio.setPayloadSize(10);
+    radio.openReadingPipe(1, (byte*)("ctrlr"));
+    radio.startListening();
+    radio.setPALevel(RF24_PA_MAX);
+    radio.setDataRate(RF24_250KBPS);
+    radio.setCRCLength(RF24_CRC_8);
+    radio.setChannel(75);
+    radio.printDetails();
+    //delay(30000);
 }
 
-const double INTEGRAL_ACTIVE_ZONE = 20.0;
-double pid(double kp, double ki, double kd, double target, double &error, double &errorTotal, double &prevError, double sensVal, double dt)
-{
-  error = target - sensVal;
-  errorTotal += error*dt;
-  double rateError = (error - prevError)/(double)(dt);
-
-  double proportional = kp * error;
-  double integral = ki * errorTotal;
-  double derivative = kd * rateError;
-  //if error and derivative are the same sign
-  // and derivative won't make div by 0 errors
-  if((derivative > 0 && error > 0) || (derivative < 0 && error < 0)) {
-    derivative = 0;
-  }
-
-  // Limit Integral to the Integral Active Zone
-  if(integral > INTEGRAL_ACTIVE_ZONE) integral = INTEGRAL_ACTIVE_ZONE;
-  if(integral < -INTEGRAL_ACTIVE_ZONE) integral = -INTEGRAL_ACTIVE_ZONE;
-
-  prevError = error;
-
-  return proportional + integral + derivative;
-}
-
-void setupRadio()
-{
-  radio.begin();
-  radio.setRetries(15, 15);
-
-  // optionally, reduce the payload size.  seems to
-  // improve reliability
-  //radio.setPayloadSize(8);
-  radio.openReadingPipe(1, pipe);
-  radio.startListening();
-  radio.printDetails();
-  radio.setPALevel(RF24_PA_MAX);
-}
-
-int radioData[3];
-void updateRadio()
-{
-  // if there is data ready
-  while( radio.available() )
-  {
-    blinkState = !blinkState;
-    digitalWrite(LED_PIN, blinkState);
-    radio.read( &radioData, sizeof(int[3]) );
-  }
-}
-
+uint16_t data[5] = {3, 3, 3, 3, 3};
 double deltaTime = 0.0;
 long time0 = millis()-5;
 int throttle = MIN_MOTOR_POWER;
-double kpYaw = 0.7, kiYaw = 0.28, kdYaw = 0.6, targetYaw = 0.0, errorYaw = 0.0, totalErrorYaw = 0.0, prevErrorYaw = 0.0;
-double kpPitch = 3.4, kiPitch = 0.28, kdPitch = 2.0, targetPitch = 0.0, errorPitch = 0.0, totalErrorPitch = 0.0, prevErrorPitch = 0.0;
-double kpRoll = 3.4, kiRoll = 0.28, kdRoll = 2.0, targetRoll = 0.0, errorRoll = 0.0, totalErrorRoll = 0.0, prevErrorRoll = 0.0;
-
+//double kpYaw = 0.7, kiYaw = 0.28, kdYaw = 0.6, targetYaw = 0.0, errorYaw = 0.0, totalErrorYaw = 0.0, prevErrorYaw = 0.0;
+//double kpPitch = 3.4, kiPitch = 0.28, kdPitch = 2.0, targetPitch = 0.0, errorPitch = 0.0, totalErrorPitch = 0.0, prevErrorPitch = 0.0;
+//double kpRoll = 3.4, kiRoll = 0.28, kdRoll = 2.0, targetRoll = 0.0, errorRoll = 0.0, totalErrorRoll = 0.0, prevErrorRoll = 0.0;
+bool bCal = false;
 void loop() {
     deltaTime = (double(millis()-time0))/1000.0;
     time0 = millis();
@@ -179,22 +156,49 @@ void loop() {
         // track FIFO count here in case there is > 1 packet available
         // (this lets us immediately read more without waiting for an interrupt)
         fifoCount -= packetSize;
-
-        updateRadio();
-        throttle = radioData[0];
-        targetPitch = radioData[1];
-        targetRoll = radioData[2];
+        radio.startListening();
+        // if there is data ready
+        if(radio.available()) {
+          prevRadioUpdateT = millis();
+          radio.read(&data, sizeof(uint16_t[5]));
+          Serial.print("recieved:\t");
+          for(int i = 0; i < 4; i++) {
+            Serial.print(data[i]);
+            Serial.print("\t");
+          }
+          Serial.print(data[4] >> 8);
+          Serial.print("\t");
+          Serial.print(data[4] & 0b11111111);
+          Serial.print("\t");
+          Serial.println();
+          pitch_pid.kp = roll_pid.kp = data[0] / 1000.0;
+          pitch_pid.ki = roll_pid.ki = data[1] / 100000.0;
+          pitch_pid.kd = roll_pid.kd = data[2] / 100.0;
+          throttle = MIN_MOTOR_POWER + data[3] / 10;
+          pitch_pid.target = ((int)(data[4] >> 8) - 127) / 100.0;
+          roll_pid.target = ((int)(data[4] & 0b11111111) - 127) / 100.0;
+          yaw_pid.target = 0;
+        }
         // display Euler angles in degrees
         mpu.dmpGetQuaternion(&q, fifoBuffer);
         mpu.dmpGetGravity(&gravity, &q);
         mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-        int yawFactor = pid(kpYaw, kiYaw, kdYaw, targetYaw, errorYaw, totalErrorYaw, prevErrorYaw, ypr[0] * (180.0/M_PI), deltaTime);
-        int pitchFactor = pid(kpPitch, kiPitch, kdPitch, targetPitch, errorPitch, totalErrorPitch, prevErrorPitch, ypr[1] * (180.0/M_PI), deltaTime);
-        int rollFactor = pid(kpRoll, kiRoll, kdRoll, targetRoll, errorRoll, totalErrorRoll, prevErrorRoll, ypr[2] * (180.0/M_PI), deltaTime);
-        int outFL = throttle - rollFactor - pitchFactor - yawFactor;
-        int outFR = throttle + rollFactor - pitchFactor + yawFactor;
-        int outBL = throttle - rollFactor + pitchFactor + yawFactor;
-        int outBR = throttle + rollFactor + pitchFactor - yawFactor;
+        if(!bCal) {
+          pitchCal = ypr[1];
+          rollCal = ypr[2];
+          yawCal = ypr[0];
+          bCal = true;
+        }
+        pitch_pid.sensVal = ypr[1];
+        roll_pid.sensVal = ypr[2];
+        yaw_pid.sensVal = ypr[0];
+        int pitch = updatePID(&pitch_pid);
+        int roll = updatePID(&roll_pid);
+        int yaw = updatePID(&yaw_pid);
+        int outFL = throttle - roll - pitch - yaw;
+        int outFR = throttle + roll - pitch + yaw;
+        int outBL = throttle - roll + pitch + yaw;
+        int outBR = throttle + roll + pitch - yaw;
         if(outFL < MIN_MOTOR_POWER) outFL = MIN_MOTOR_POWER;
         if(outFL > MAX_MOTOR_POWER) outFL = MAX_MOTOR_POWER;
         if(outFR < MIN_MOTOR_POWER) outFR = MIN_MOTOR_POWER;
@@ -207,5 +211,8 @@ void loop() {
         escfr.writeMicroseconds(outFR);
         escbl.writeMicroseconds(outBL);
         escbr.writeMicroseconds(outBR);
+    }
+    if((long)millis() - prevRadioUpdateT < 1000L) {
+      digitalWrite(LED_PIN, (millis() / 50) % 10 == 0);
     }
 }

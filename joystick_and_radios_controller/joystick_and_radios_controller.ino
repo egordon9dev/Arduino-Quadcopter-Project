@@ -2,60 +2,63 @@
 #include "nRF24L01.h"
 #include "RF24.h"
 #include "printf.h"
+#include <SoftwareSerial.h>
+#include <LiquidCrystal_I2C.h>
+#include "Nunchuk.h"
 
-RF24 radio(9, 10);
-
-const uint64_t pipe = 0xF0F0F0F0E1LL;
+LiquidCrystal_I2C lcd(0x3f, 2, 1, 0, 4, 5, 6, 7, 3, POSITIVE);
+RF24 radio(7, 8);
 
 void setup(void)
 {
-  Serial.begin(57600);
+  Serial.begin(9600);
   printf_begin();
-
+  Wire.begin();
+  nunchuk_init();
+  lcd.begin(16,2);
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("init");
   radio.begin();
-
-  // optionally, increase the delay between retries & # of retries
-  radio.setRetries(15, 15);
-
-  // optionally, reduce the payload size.  seems to
-  // improve reliability
-  //radio.setPayloadSize(8);
-
-  radio.openWritingPipe(pipe);
-
-  radio.startListening();
-
+  radio.setAutoAck(1);
+  radio.enableAckPayload();
+  radio.setRetries(0, 15);
+  radio.setPayloadSize(10);
+  radio.openWritingPipe((byte*)("ctrlr"));
+  radio.stopListening();
+  radio.setPALevel(RF24_PA_MAX);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setCRCLength(RF24_CRC_8);
+  radio.setChannel(75);
   radio.printDetails();
 }
-
-double myMap(double x, double in_min, double in_max, double out_min, double out_max)
-{
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
-
+int8_t rollUnsc = 0, pitchUnsc = 0;
 void loop(void) {
-  int pot = 1023 - analogRead(A0);
-  int joyX = analogRead(A1);
-  int joyY = 1023 - analogRead(A2);
-  //Serial.println("pot: " + String(pot) + "\t" + "joy x: " + String(joyX) + "joy y: " + String(joyY));
-
-  double throttle = myMap(pot, 0.0, 1023.0, 0.0, 500.0);
-  double roll = myMap(joyX, 0, 1023, -20.0, 20.0);
-  double pitch = myMap(joyY, 0, 1023, -20.0, 20.0);
-
-  if(roll < 2 && roll > -2) roll = 0;
-  if(pitch < 2 && pitch > -2) pitch = 0;
-
-  Serial.println("sending... throttle: " + String(throttle) + "\pitch: " + String(pitch) + "\troll: " + String(roll));
-  
-  double data[3] = {throttle, pitch, roll};
-  // First, stop listening so we can talk
+  if(nunchuk_read()) {
+    rollUnsc = nunchuk_joystickX();
+    pitchUnsc = nunchuk_joystickY();
+  }
+  int kpUnsc = analogRead(A0), kiUnsc = analogRead(A1),
+  kdUnsc = analogRead(A2), thrUnsc = analogRead(A3);
+    
+  uint16_t data[5] = {kpUnsc, kiUnsc, kdUnsc, thrUnsc, ((pitchUnsc + 127) << 8) + rollUnsc + 127};
   radio.stopListening();
-  // Send the final one back.
-  radio.write( &data, sizeof(double[3]) );
-
-  // Now, resume listening so we catch the next packets.
-  radio.startListening();
-
+  radio.write(&data, sizeof(uint16_t[5]));
+  Serial.print("sent:\t");
+  for(int i = 0; i < 4; i++) {
+    Serial.print(data[i]);
+    Serial.print("\t");
+  }
+  Serial.print(data[4] >> 8);
+  Serial.print("\t");
+  Serial.print(data[4] & 0b11111111);
+  Serial.print("\t");
+  Serial.println();
+  char s[15] = "";
+  sprintf(s, "%4d %4d %4d", data[0], data[1], data[2]);
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(s);
   delay(50);
 }
