@@ -21,17 +21,14 @@ void setup(void)
   lcd.setCursor(0,0);
   lcd.print("init");
   radio.begin();
-  radio.setAutoAck(1);
-  radio.enableAckPayload();
-  radio.setRetries(0, 15);
+  radio.setAutoAck(0);
+  radio.setRetries(15, 15);
   radio.setPayloadSize(10);
   radio.openWritingPipe((byte*)("ctrlr"));
-  radio.stopListening();
   radio.setPALevel(RF24_PA_MAX);
   radio.setDataRate(RF24_250KBPS);
   radio.setCRCLength(RF24_CRC_8);
-  radio.setChannel(75);
-  radio.printDetails();
+  radio.setChannel(20);
 }
 int8_t rollUnsc = 0, pitchUnsc = 0;
 void loop(void) {
