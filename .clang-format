@@ -1,7 +1,8 @@
 BasedOnStyle: Google
-IndentWidth: 4
+IndentWidth: 2
 ColumnLimit: 1000
 AllowShortBlocksOnASingleLine: true
 AllowShortCaseLabelsOnASingleLine: true
 AllowShortFunctionsOnASingleLine: true
 AllowShortIfStatementsOnASingleLine: true
+AlignTrailingComments: false
